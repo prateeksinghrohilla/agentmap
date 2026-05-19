@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from core import adapters
+from core.router import route, route_to_json
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="route",
+        description="Cross-tool task router for AI coding agents.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("task", nargs="?", default=None,
+                        help="The task description to route.")
+    parser.add_argument("--target", "-t", default=None)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--enumerate", action="store_true")
+    parser.add_argument("--list-tools", action="store_true")
+    parser.add_argument("--rebuild-index", action="store_true")
+    parser.add_argument("--top", type=int, default=6)
+    parser.add_argument("--project-root", default=None)
+
+    args = parser.parse_args(argv)
+    project_root = Path(args.project_root) if args.project_root else None
+
+    if args.list_tools:
+        return _cmd_list_tools()
+    if args.rebuild_index:
+        return _cmd_rebuild_index(args.target, project_root)
+    if not args.task:
+        parser.error("task description is required, or use --list-tools / --rebuild-index")
+    if args.enumerate:
+        return _cmd_enumerate(args.task, args.target, project_root, json_out=args.json)
+    return _cmd_route(args.task, args.target, project_root,
+                      json_out=args.json, top_n=args.top)
+
+
+def _cmd_list_tools() -> int:
+    installed = adapters.detect_installed()
+    print("Installed AI coding tools detected on this machine:")
+    if not installed:
+        print("  (none. no adapters matched)")
+        return 1
+    for a in installed:
+        print(f"  - {a.name:<14} {a.display_name}  (invocation: {a.invocation_style})")
+    not_installed = [c().name for c in adapters.ALL if not c().detect()]
+    if not_installed:
+        print("\nNot detected:")
+        for n in not_installed:
+            print(f"  - {n}")
+    return 0
+
+
+def _cmd_rebuild_index(target: str | None, project_root: Path | None) -> int:
+    if target:
+        adapter_list = [adapters.get(target)]
+    else:
+        adapter_list = adapters.detect_installed()
+        if not adapter_list:
+            print("No tools detected. Nothing to rebuild.", file=sys.stderr)
+            return 1
+    for adapter in adapter_list:
+        method = getattr(adapter, "_build_index", None)
+        if not callable(method):
+            print(f"[{adapter.name}] no index to rebuild (skipped)")
+            continue
+        try:
+            method()
+            print(f"[{adapter.name}] index rebuilt")
+        except Exception as e:
+            print(f"[{adapter.name}] rebuild failed: {e}", file=sys.stderr)
+    return 0
+
+
+def _cmd_enumerate(task: str, target: str | None, project_root: Path | None,
+                   *, json_out: bool) -> int:
+    from core.scoring import extract_keywords, extract_verbs, score_candidate
+    from core.router import ScoredCandidate
+
+    adapter = _resolve_adapter(target, project_root)
+    keywords = extract_keywords(task)
+    verbs = extract_verbs(task)
+    raw = adapter.enumerate_candidates(keywords)
+    scored = [
+        ScoredCandidate(candidate=c, score=score_candidate(c, task, keywords, verbs))
+        for c in raw
+    ]
+    scored.sort(key=lambda x: x.score.total, reverse=True)
+
+    if json_out:
+        payload = {
+            "task": task, "tool": adapter.name,
+            "keywords": keywords, "verbs": sorted(verbs),
+            "candidates": [s.to_dict() for s in scored[:30]],
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"Task: {task}")
+        print(f"Tool: {adapter.display_name}")
+        print(f"Keywords: {', '.join(keywords)}")
+        print(f"Verbs: {', '.join(sorted(verbs)) or '(none)'}")
+        print()
+        if not scored:
+            print("No candidates matched these keywords.")
+        else:
+            print(f"{'Score':>6}  {'Kind':<9} {'Name':<40} Description")
+            print("-" * 80)
+            for s in scored[:30]:
+                desc = s.candidate.description[:50]
+                print(f"{s.score.total:>6.1f}  {s.candidate.kind:<9} "
+                      f"{s.candidate.name[:40]:<40} {desc}")
+    return 0
+
+
+def _cmd_route(task: str, target: str | None, project_root: Path | None,
+               *, json_out: bool, top_n: int) -> int:
+    if json_out:
+        print(route_to_json(task, target=target, project_root=project_root, top_n=top_n))
+        return 0
+    verdict = route(task, target=target, project_root=project_root, top_n=top_n)
+    _render_verdict_human(verdict)
+    return 0
+
+
+def _render_verdict_human(verdict) -> None:
+    print(f"Task: {verdict.task}")
+    print(f"Tool: {verdict.tool}")
+    print(f"Keywords: {', '.join(verdict.keywords)}")
+    print()
+    if verdict.mechanism == "direct":
+        print("Don't delegate. handle inline.")
+        print(f"  {verdict.reason}")
+        return
+    if verdict.mechanism == "orchestrate":
+        print("Multi-domain task. Recommend orchestrating:")
+        for i, step in enumerate(verdict.orchestrate_steps, start=1):
+            print(f"  {i}. {step.candidate.kind}:{step.candidate.name} "
+                  f". {step.candidate.description[:80]}")
+        print(f"\n  Reason: {verdict.reason}")
+        return
+    print(f"Best fit: {verdict.mechanism.upper()} -> {verdict.primary.candidate.name}")
+    print(f"  {verdict.primary.candidate.description[:200]}")
+    print()
+    if verdict.runner_up:
+        print(f"Runner-up: {verdict.runner_up.candidate.kind.upper()} -> "
+              f"{verdict.runner_up.candidate.name}")
+        print(f"  {verdict.runner_up.candidate.description[:160]}")
+        print()
+    print(f"Reason: {verdict.reason}")
+    print()
+    print("Invoke with:")
+    for line in verdict.invocation.splitlines():
+        print(f"  {line}")
+
+
+def _resolve_adapter(target: str | None, project_root: Path | None):
+    if target:
+        return adapters.get(target)
+    installed = adapters.detect_installed()
+    if not installed:
+        return adapters.get("claude-code")
+    return installed[0]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

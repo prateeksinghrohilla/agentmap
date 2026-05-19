@@ -1,0 +1,103 @@
+---
+description: Cross-tool task router for AI coding agents. Picks between skills, subagents, direct inline work, and multi-domain orchestration. Invoke with @route <task> in Cursor chat to get a deterministic routing recommendation that bypasses Cursor's default rule auto-attachment heuristics.
+---
+
+# Cross-Tool Router (Cursor edition)
+
+## When you (the Cursor agent) are invoked via `@route <task>`
+
+The user wants a deterministic recommendation for how to handle a task. Routing across:
+
+1. **Cursor rules** in `.cursor/rules/**/*.mdc` (Manual + Agent-Requested types)
+2. **Subagents in adjacent tools** (Claude Code agents in `~/.claude/agents/`, Codex/OpenCode skills in `.agents/skills/`). only relevant if the user runs multiple tools side-by-side
+3. **Direct inline work** when the task is trivial
+4. **Orchestration** when the task spans multiple disciplines
+
+## Procedure
+
+### Step 1. Call the router CLI if available
+
+```bash
+"$HOME/.agentmap/cli/route" --target=cursor --json --top=15 "<the task>"
+```
+
+If the CLI isn't installed, fall back to Step 2.
+
+### Step 2. Manual enumeration (fallback)
+
+Walk up from the current file's directory looking for `.cursor/rules/`. Read every `*.mdc` and `*.md` file. For each, read the frontmatter:
+
+- `alwaysApply: true` → "Always" rule; **not routable** (attaches automatically)
+- `globs: [...]` set → "Auto-Attached" rule; **not routable** unless the task touches matching files
+- `description: ...` only → "Agent-Requested" rule; **routable** based on description match
+- None of the above → "Manual" rule; **routable** by explicit `@name`
+
+Score each candidate (Agent-Requested + Manual rules only) on:
+- Domain match (description keywords vs task keywords)
+- Verb match (review/build/debug/etc.)
+- Negative signals (description says "do NOT use for X" → hard exclude)
+
+### Step 3. Pick a mechanism
+
+- **Single rule fits** → recommend `@rule-name`
+- **No specialized rule fits** → recommend Cursor's default behavior (just respond to the task without invoking any specific rule)
+- **Trivial task** → say so explicitly, don't delegate
+- **Multi-domain task** → list the 2-3 rules to attach in sequence, or recommend running them as Composer steps
+
+## Output format
+
+Pick **one** block, no preamble:
+
+```
+🎯 Best fit: RULE → @<rule-name>
+   <one sentence. what triggered the match>
+
+🥈 Runner-up: RULE → @<rule-name>
+   <one sentence>
+
+▶️  Invoke with:  @<rule-name> <restate the task>
+```
+
+Or:
+
+```
+🚫 Don't delegate. handle inline.
+   <reason>
+```
+
+Or:
+
+```
+🔀 Multi-domain task. Recommend invoking in sequence:
+   1. @<rule-1>. <subtask>
+   2. @<rule-2>. <subtask>
+   3. synthesis. review end-to-end consistency
+```
+
+Or:
+
+```
+ℹ️  No specialized rule fits. Cursor's default behavior is the right call.
+   <reason>
+```
+
+
+## Use your judgment
+
+The deterministic score is a hint, not a rule. Read every candidate's name and description carefully. If a lower-scored candidate is clearly a better semantic fit for the task, recommend that one instead. Examples of when to override:
+- A candidate's name semantically matches the task domain but its description happens to score lower than an unrelated candidate that shares incidental keywords
+- The top-scored candidate is from a wrong domain (the description happens to contain task keywords by coincidence)
+- The top-scored candidate has a scoping caveat (e.g. for a specific framework) that doesn't fit the user's actual context
+
+Your judgment beats the scorer when they disagree.
+
+## Hard rules
+
+- Cursor has no global filesystem rules directory. all routing is project-local. If the user wants a rule globally, point them to Cursor Settings → Rules → User Rules.
+- Do not invent rule names. Only those you actually found in `.cursor/rules/`.
+- Cursor cannot invoke "subagents" or "skills" from other tools natively. If you detect those candidates from the CLI, mention them as informational but recommend a Cursor-native action (rule or inline).
+- The router's negative-signal logic is the differentiator. respect "do NOT use for X" hard excludes.
+
+## Why this rule exists
+
+Cursor's rule attachment is automatic and globs-driven; there's no built-in way to deterministically pick the right rule for an arbitrary task. This rule lets the user say `@route <task>` and get back a clear, single-best-fit recommendation. same logic as the cross-tool CLI, native to Cursor's invocation style.
